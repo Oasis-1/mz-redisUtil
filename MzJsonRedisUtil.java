@@ -223,12 +223,110 @@ public class MzJsonRedisUtil {
     public  <T,Id>T getWithMutex(String keyPrefix, Id id, Class<T> T, Function<Id,T> dbFailBack, Long time, TimeUnit timeUnit,String lockPrefix) {
         return getWithMutex(keyPrefix,id,T,dbFailBack,time,timeUnit,time,timeUnit,lockPrefix,30L,TimeUnit.SECONDS);
     }
-    private boolean tryLock(String key,Long lockTime,TimeUnit lockTimeUnit){
+        private boolean tryLock(String key,Long lockTime,TimeUnit lockTimeUnit){
         Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", lockTime, lockTimeUnit);
         return BooleanUtil.isTrue(flag);
     }
     private void unLock(String key){
         stringRedisTemplate.delete(key);
+    }
+
+    /**
+     * 上锁加ID
+     * 给锁加上一个uuid，在占锁的时候就加上uuid，删除锁的时候判断是否是自己的锁
+     * @param key
+     * @param lockTime
+     * @param lockTimeUnit
+     * @return
+     */
+    private boolean tryIdLock(String key,Long lockTime,TimeUnit lockTimeUnit){
+        String idStr = IdUtil.getSnowflake().nextIdStr();
+        Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, idStr, lockTime, lockTimeUnit);
+        return BooleanUtil.isTrue(flag);
+    }
+
+    /**
+     * 解锁加ID
+     * 通过lua脚本删锁，保证删锁操作也是一个原子操作。
+     * @param key
+     * @return
+     */
+    private void unIdLock(String key){
+        String idStr = stringRedisTemplate.opsForValue().get(key);
+        String script = "if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end";
+        stringRedisTemplate.execute(new DefaultRedisScript<>(script,Long.class), Collections.singletonList(key), idStr);
+    }
+
+    /**
+     * Lambda 函数编程 全局锁
+     * @param key
+     * @param back 加锁后执行的语句
+     * @param msg 加锁失败后的消息
+     * @param time 时间长度
+     * @param timeUnit 时间单位
+     * @return
+     * @param <T>
+     */
+    public <T> T redisLock(String key,Supplier<T> back,String msg, Long time, TimeUnit timeUnit) {
+        boolean lock = tryLock(key, time, timeUnit);
+        if (!lock) {
+            try {
+                Thread.sleep(3000);
+                lock = tryLock(key, time, timeUnit);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        if (lock) {
+            try {
+                return back.get();
+            }catch (Exception e){
+                log.error("全局锁运行错误", e);
+            }
+            finally {
+                unLock(key);
+            }
+        }
+        throw new RuntimeException(msg);
+    }
+
+    /**
+     * Lambda 函数编程 全局锁 加ID
+     * @param key
+     * @param back 加锁后执行的语句
+     * @param msg 加锁失败后的消息
+     * @param timeoutBack 获取自选等待时间 ()-> TimeUnit.SECONDS.toMillis(3)
+     * @param time 时间长度
+     * @param timeUnit 时间单位
+     * @return
+     * @param <T>
+     */
+    public <T> T redisIdLock(String key,Supplier<T> back,String msg, Supplier<Long> timeoutBack,Long time, TimeUnit timeUnit) {
+        boolean lock = tryIdLock(key, time, timeUnit);
+        if (!lock) {
+            long start = System.currentTimeMillis();
+            Long timeoutMillis = timeoutBack.get();
+            while ((System.currentTimeMillis() - start) < timeoutMillis && !lock){
+                // 自旋等待，并防止出现死锁
+                try {
+                    Thread.sleep(10);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                lock = tryIdLock(key, time, timeUnit);
+            }
+        }
+        if (lock) {
+            try {
+                return back.get();
+            }catch (Exception e){
+                log.error("全局锁运行错误", e);
+            }
+            finally {
+                unIdLock(key);
+            }
+        }
+        throw new RuntimeException(msg);
     }
 
     private ExecutorService CACHE_REBUILD_EXECUTOR= Executors.newFixedThreadPool(5);
